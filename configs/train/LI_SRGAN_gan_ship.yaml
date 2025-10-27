@@ -1,0 +1,116 @@
+# experiment name  实验名称
+EXP_NAME: LI_SRGAN_gan_ship
+# random number seed
+SEED: 0
+# super resolution magnification factor
+SCALE: 4
+# run device model
+DEVICE_ID: 0
+
+# Model define
+MODEL:
+  EMA:
+    ENABLE: True
+    DECAY: 0.999
+    COMPILED: True
+  G:
+    NAME: srresnet_x4
+    IN_CHANNELS: 3
+    OUT_CHANNELS: 3
+    CHANNELS: 64
+    NUM_RCB: 14  # 源文件值为16
+    COMPILED: True
+  D:
+    NAME: discriminator_for_vgg
+    IN_CHANNELS: 3
+    OUT_CHANNELS: 1
+    CHANNELS: 64
+    COMPILED: False
+
+TRAIN:
+  DATASET:
+    # 修改数据集路径！256x256 HR 训练图像
+    TRAIN_GT_IMAGES_DIR: "/root/workspace/datasets/lightweight_SRGAN/ImageSize/out_image-size-256"
+
+    # 训练时的裁剪尺寸 (!! 关键 !!)
+    GT_IMAGE_SIZE: 256  # 这就是论文中的 crop_size=256
+
+  # Model file address, used for pre-training and recovery training
+  CHECKPOINT:
+    # !! 重点 !!
+    
+    # G 模型的预训练权重路径 (!! 必须填入阶段一的输出路径 !!)
+    PRETRAINED_G_MODEL: "results/LI_SRGAN_pretrain_ship/g_best.pth.tar"
+    
+    PRETRAINED_D_MODEL: ""
+    RESUMED_G_MODEL: ""
+    RESUMED_D_MODEL: ""
+
+  # training hyperparameters
+  HYP:
+    # 训练轮数
+    EPOCHS: 100
+    
+    # 批量大小
+    IMGS_PER_BATCH: 16
+    SHUFFLE: True
+    NUM_WORKERS: 4 # 解决共享内存不足问题，原始为4.(由数据加载器的工作进程数量引起的)?
+    PIN_MEMORY: True
+    PERSISTENT_WORKERS: True
+
+  OPTIM:
+    NAME: Adam
+    # 学习率 (G和D都使用这个)
+    LR: 1.0e-3 # 论文中的 1e-3
+    
+    # 论文中的 Adam-β1 和 Adam-β2
+    BETAS: [0.0, 0.9]
+    
+    EPS: 0.00000001
+    WEIGHT_DECAY: 0.0
+
+  LR_SCHEDULER:
+    NAME: MultiStepLR
+    MILESTONES: [ 9 ]
+    GAMMA: 0.5
+
+  # Loss function
+  LOSSES:
+    PIXEL_LOSS:
+      NAME: MSELoss
+      WEIGHT: [ 1.0 ]
+    CONTENT_LOSS:
+      NAME: ContentLoss
+      NET_CFG_NAME: "vgg19"
+      BATCH_NORM: False
+      NUM_CLASSES: 1000
+      MODEL_WEIGHTS_PATH: ""
+      FEATURE_NODES: [ "features.35" ]
+      FEATURE_NORMALIZE_MEAN: [ 0.485, 0.456, 0.406 ]
+      FEATURE_NORMALIZE_STD: [ 0.229, 0.224, 0.225 ]
+      WEIGHT: [ 1.0 ]
+    ADVERSARIAL_LOSS:
+      NAME: vanilla
+      WEIGHT: [ 0.001 ]
+
+  PRINT_FREQ: 100
+
+TEST:
+  DATASET:
+    # 验证集HR图像路径
+    PAIRED_TEST_GT_IMAGES_DIR: "/root/workspace/datasets/lightweight_SRGAN/val_hr_256"
+    # 验证集LR图像路径
+    PAIRED_TEST_LR_IMAGES_DIR: "/root/workspace/datasets/lightweight_SRGAN/val_lr_64"
+
+  # Test hyperparameters
+  HYP:
+    IMGS_PER_BATCH: 1
+    SHUFFLE: False
+    NUM_WORKERS: 1
+    PIN_MEMORY: True
+    PERSISTENT_WORKERS: True
+
+  # Only test Y channel
+  ONLY_TEST_Y_CHANNEL: True
+
+  SAVE_IMAGE_DIR: ""

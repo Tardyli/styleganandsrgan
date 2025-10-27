@@ -44,16 +44,83 @@ def _make_layers(net_cfg_name: str, batch_norm: bool = False) -> nn.Sequential:
         else:
             v = cast(int, v)
             conv2d = nn.Conv2d(in_channels, v, (3, 3), (1, 1), (1, 1))
-            if batch_norm:
-                layers.append(conv2d)
-                layers.append(nn.BatchNorm2d(v))
-                layers.append(nn.ReLU(True))
-            else:
-                layers.append(conv2d)
-                layers.append(nn.ReLU(True))
+            # 已删除了BN层
+            layers.append(conv2d)   
+            layers.append(nn.ReLU(True))
             in_channels = v
 
     return layers
+
+#----------------------------------------------------------------------------
+# 深度可分离卷积 (Depthwise Separable Convolution)。这是“沙漏结构”的基础，用于减少参数量
+import torch.nn as nn
+
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, 
+                                   padding, groups=in_channels, bias=True)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 
+                                   kernel_size=1, bias=True)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+#----------------------------------------------------------------------------
+
+#----------------------------------------------------------------------------
+# 红外线性灰度变换 (LGT)。这个模块用于调整特征图的对比度和亮度。k 和 b 是可学习的参数。
+import torch
+import torch.nn as nn
+
+class LinearGrayTransform(nn.Module):
+    def __init__(self, in_channels):
+        super(LinearGrayTransform, self).__init__()
+        # 初始化可学习的对比度(k)和亮度(b)参数
+        # 形状为 (1, C, 1, 1) 以便广播到 (B, C, H, W) 的特征图
+        self.k = nn.Parameter(torch.ones(1, in_channels, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
+        
+    def forward(self, x):
+        # 应用线性变换 y = k*x + b
+        return self.k * x + self.b
+#----------------------------------------------------------------------------
+
+#----------------------------------------------------------------------------
+# 轻型注意力残差块 (LARB)。这是最重要的核心模块，它将取代原有的 ResidualBlock
+import torch.nn as nn
+
+class LightweightAttentionResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(LightweightAttentionResidualBlock, self).__init__()
+
+        # 主路径：沙漏结构
+        # 使用深度可分离卷积来降低参数
+        self.main_path = nn.Sequential(
+            DepthwiseSeparableConv(in_features, in_features, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            DepthwiseSeparableConv(in_features, in_features, kernel_size=3, padding=1)
+        )
+
+        # 注意力路径 (在跳跃连接上)
+        self.attention_path = nn.Sequential(
+            nn.Conv2d(in_features, in_features, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 论文描述比较模糊，这里提供一个最合理的实现：
+        # 注意力图作用于主路径提取的特征，然后与输入进行残差连接
+        main_out = self.main_path(x)
+        attention_map = self.attention_path(x)
+        
+        # 残差连接
+        # output = input + attention * features
+        out = x + main_out * attention_map
+        return out
+#----------------------------------------------------------------------------
+
 
 
 class _FeatureExtractor(nn.Module):
@@ -83,9 +150,7 @@ class _FeatureExtractor(nn.Module):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
+            # 已删除BN层
             elif isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, 0, 0.01)
                 nn.init.constant_(module.bias, 0)
@@ -103,13 +168,13 @@ class _FeatureExtractor(nn.Module):
         return x
 
 
-class SRResNet(nn.Module):
+class SRResNet(nn.Module): # 生成器，相当于Generator
     def __init__(
             self,
             in_channels: int = 3,
             out_channels: int = 3,
             channels: int = 64,
-            num_rcb: int = 16,
+            num_rcb: int = 14, # 源代码为16，按照论文改成14
             upscale: int = 4,
     ) -> None:
         super(SRResNet, self).__init__()
@@ -119,19 +184,32 @@ class SRResNet(nn.Module):
             nn.PReLU(),
         )
 
-        # High frequency information extraction block
+        # 修改点 3: 重建 self.trunk 序列
+        # -----------------------------------------------------------------
+        # 原来的代码:
+        # trunk = []
+        # for _ in range(num_rcb):
+        # 	  trunk.append(_ResidualConvBlock(channels))
+        # self.trunk = nn.Sequential(*trunk)
+        #
+        # 替换为下面的新逻辑:
         trunk = []
-        for _ in range(num_rcb):
-            trunk.append(_ResidualConvBlock(channels))
+        for i in range(num_rcb):
+            # 每次循环都添加一个LARB
+            trunk.append(LightweightAttentionResidualBlock(in_features=channels))
+            # 在第7个和第14个LARB后添加LGT模块
+            if i + 1 == 7 or i + 1 == 14:
+                trunk.append(LinearGrayTransform(in_channels=channels))
         self.trunk = nn.Sequential(*trunk)
+        # -----------------------------------------------------------------
 
-        # High-frequency information linear fusion layer
+        # High-frequency information linear fusion layer 高频信息线性融合层
         self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=True), # bias设置成True,因为没有BN层了
+            # 已删除BN层
         )
 
-        # zoom block
+        # zoom block 上采样模块
         upsampling = []
         if upscale == 2 or upscale == 4 or upscale == 8:
             for _ in range(int(math.log(upscale, 2))):
@@ -149,8 +227,7 @@ class SRResNet(nn.Module):
                 nn.init.kaiming_normal_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
+            # 已删除BN层
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
@@ -160,7 +237,7 @@ class SRResNet(nn.Module):
         conv1 = self.conv1(x)
         x = self.trunk(conv1)
         x = self.conv2(x)
-        x = torch.add(x, conv1)
+        x = torch.add(x, conv1) # 全局残差连接
         x = self.upsampling(x)
         x = self.conv3(x)
 
@@ -182,42 +259,57 @@ class DiscriminatorForVGG(nn.Module):
             nn.Conv2d(in_channels, channels, (3, 3), (1, 1), (1, 1), bias=True),
             nn.LeakyReLU(0.2, True),
             # state size. (64) x 48 x 48
-            nn.Conv2d(channels, channels, (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, (3, 3), (2, 2), (1, 1), bias=True), # bias改为true
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(channels, int(2 * channels), (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(int(2 * channels)),
+            nn.Conv2d(channels, int(2 * channels), (3, 3), (1, 1), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
             # state size. (128) x 24 x 24
-            nn.Conv2d(int(2 * channels), int(2 * channels), (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(int(2 * channels)),
+            nn.Conv2d(int(2 * channels), int(2 * channels), (3, 3), (2, 2), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(int(2 * channels), int(4 * channels), (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(int(4 * channels)),
+            nn.Conv2d(int(2 * channels), int(4 * channels), (3, 3), (1, 1), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
             # state size. (256) x 12 x 12
-            nn.Conv2d(int(4 * channels), int(4 * channels), (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(int(4 * channels)),
+            nn.Conv2d(int(4 * channels), int(4 * channels), (3, 3), (2, 2), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(int(4 * channels), int(8 * channels), (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(int(8 * channels)),
+            nn.Conv2d(int(4 * channels), int(8 * channels), (3, 3), (1, 1), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
             # state size. (512) x 6 x 6
-            nn.Conv2d(int(8 * channels), int(8 * channels), (3, 3), (2, 2), (1, 1), bias=False),
-            nn.BatchNorm2d(int(8 * channels)),
+            nn.Conv2d(int(8 * channels), int(8 * channels), (3, 3), (2, 2), (1, 1), bias=True),
+            # 已删除BN层
             nn.LeakyReLU(0.2, True),
         )
 
+
+
+
+# --------------------【修改点 1】--------------------
+        # 计算分类器的输入维度： channels * H * W
+        # 原始 96x96 -> 6x6,  现在 256x256 -> 16x16
+        # 8 * channels = 512
+        classifier_input_features = int(8 * channels) * 16 * 16 
+        # ---------------------------------------------------
+        
+        
         self.classifier = nn.Sequential(
-            nn.Linear(int(8 * channels) * 6 * 6, 1024),
+            # --------------------【修改点 2】--------------------
+            nn.Linear(classifier_input_features, 1024), # 使用新的计算结果
+            # ---------------------------------------------------
             nn.LeakyReLU(0.2, True),
             nn.Linear(1024, out_channels),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # Input image size must equal 96
-        assert x.size(2) == 96 and x.size(3) == 96, "Input image size must be is 96x96"
-
+        # --------------------【修改点 3】--------------------
+        # Input image size must equal 256 (根据论文的 crop_size)
+        assert x.size(2) == 256 and x.size(3) == 256, f"Input image size must be 256x256, but got {x.size()}"
+        # ---------------------------------------------------
+        
         x = self.features(x)
         x = torch.flatten(x, 1)
         x = self.classifier(x)
@@ -229,11 +321,11 @@ class _ResidualConvBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super(_ResidualConvBlock, self).__init__()
         self.rcb = nn.Sequential(
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=True),
+            # 已删除BN层
             nn.PReLU(),
-            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, (3, 3), (1, 1), (1, 1), bias=True),
+            # 已删除BN层
         )
 
     def forward(self, x: Tensor) -> Tensor:
